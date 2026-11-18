@@ -885,6 +885,53 @@ Two more per-metric limits control what happens to measurements that are neither
         query: ...
 ```
 
+## Measurement Deduplication and Ordering
+
+Metric providers can retry a query or deliver a result with a delay. To keep each reconciliation
+round based on a single valid observation, the analysis controller applies the following rules
+when a completed measurement arrives:
+
+* **Duplicate measurements are counted once.** A measurement is recognized as a duplicate when it
+  carries the same provider-assigned measurement ID, or — when the provider does not assign one —
+  when it has the same measurement window (`startedAt`/`finishedAt`), phase and value as a
+  measurement already recorded for the metric. A duplicate is ignored: it is not appended to the
+  history again and none of the success/failure/error counters are incremented.
+* **Out-of-order results never overwrite a newer one.** When a delayed result has a `finishedAt`
+  older than the latest completed measurement on record, it is treated as stale and discarded. The
+  newest accepted measurement always wins, so a late response cannot roll back the metric to an
+  older state.
+* An in-progress (not yet completed) measurement is never considered a duplicate; it is the slot
+  that a resumed provider call is allowed to replace.
+
+These rules rely only on existing `Measurement` fields, so `AnalysisTemplate` and `Rollout`
+specs remain unchanged and fully backward compatible.
+
+## Retryable Errors and Consecutive Failures
+
+Not every `Error` measurement means the canary is unhealthy. The controller distinguishes
+transient, retryable provider problems from definitive measurement errors:
+
+* **Retryable errors** are timeouts and network/connectivity failures (deadline exceeded,
+  connection refused/reset, DNS failures, rate limiting, temporary I/O errors, ...). They are
+  logged as retryable, the measurement is retried on the error retry interval (default `10s`), and
+  they only increment the `consecutiveError` counter. A single timeout or network error therefore
+  never aborts the rollout; the metric reaches `Error` only once `consecutiveErrorLimit`
+  (default `4`) is exceeded.
+* A successful, failed, or inconclusive measurement resets `consecutiveError` to zero.
+* Malformed results and other non-retryable errors are still recorded as `Error` measurements and
+  count towards the same consecutive error threshold — unknown results are never treated as
+  success, and errors are never swallowed. Provider construction failures log the analysis run and
+  provider name for diagnosis.
+* **Consecutive failures** are tracked separately from the cumulative `failureLimit`. A
+  `Successful` measurement resets the consecutive failure streak, so an intermittent failure does
+  not get confused with a run of back-to-back failures. The cumulative `failureLimit` still
+  bounds the total number of failed measurements.
+
+When a metric reaches the `Failed` or `Error` terminal phase and the rollout aborts, the
+controller emits a warning event identifying the triggering measurement (phase, value and
+`finishedAt`), the metric provider that served it, and the current failure/error counts, so the
+abort can be traced back to the exact observation.
+
 ## Dry-Run Mode
 
 !!! important

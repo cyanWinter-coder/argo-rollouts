@@ -378,7 +378,10 @@ func (c *Controller) runMeasurements(run *v1alpha1.AnalysisRun, tasks []metricTa
 			var newMeasurement v1alpha1.Measurement
 			provider, providerErr := c.newProvider(*logger, run.Namespace, t.metric)
 			if providerErr != nil {
-				log.Errorf("Error in getting metric provider :%v", providerErr)
+				// Include the analysis run and metric/provider identity so an unreachable
+				// provider can be diagnosed; the error is surfaced as an Error measurement,
+				// never swallowed or treated as success.
+				logger.WithField("provider", metricProviderName(t.metric.Provider)).Errorf("Error in getting metric provider: %v", providerErr)
 				if t.incompleteMeasurement != nil {
 					newMeasurement = *t.incompleteMeasurement
 				} else {
@@ -418,6 +421,16 @@ func (c *Controller) runMeasurements(run *v1alpha1.AnalysisRun, tasks []metricTa
 					metricResult.Metadata = provider.GetMetadata(t.metric)
 				}
 			}
+			if provider != nil && providerErr == nil {
+				// Record the provider type on the result so abort events and status can name
+				// the provider which served the triggering measurement.
+				if metricResult.Metadata == nil {
+					metricResult.Metadata = map[string]string{}
+				}
+				if providerName := providerTypeName(provider); providerName != "" {
+					metricResult.Metadata[providerTypeMetadataKey] = providerName
+				}
+			}
 
 			if newMeasurement.Phase.Completed() {
 				logger.Infof("Measurement Completed. Result: %s", newMeasurement.Phase)
@@ -425,7 +438,29 @@ func (c *Controller) runMeasurements(run *v1alpha1.AnalysisRun, tasks []metricTa
 					finishedAt := timeutil.MetaNow()
 					newMeasurement.FinishedAt = &finishedAt
 				}
+				if newMeasurement.StartedAt == nil {
+					startedAt := *newMeasurement.FinishedAt
+					newMeasurement.StartedAt = &startedAt
+				}
+			}
 
+			// A retrying or delayed provider can hand back the same observation more than once,
+			// and a delayed result can arrive after a newer measurement was already accepted.
+			// Drop duplicates and out-of-order results so every reconciliation round applies a
+			// single, newest measurement and failure counters are never inflated.
+			if newMeasurement.Phase.Completed() && shouldDiscardMeasurement(metricResult.Measurements, newMeasurement) {
+				if isDuplicateMeasurement(metricResult.Measurements, newMeasurement) {
+					logger.Infof("Ignoring duplicate measurement (phase: %s, value: %s)", newMeasurement.Phase, newMeasurement.Value)
+				} else {
+					logger.Infof("Ignoring out-of-order measurement finished at %v: a newer measurement was already recorded", newMeasurement.FinishedAt)
+				}
+				resultsLock.Lock()
+				analysisutil.SetResult(run, *metricResult)
+				resultsLock.Unlock()
+				return nil
+			}
+
+			if newMeasurement.Phase.Completed() {
 				switch newMeasurement.Phase {
 				case v1alpha1.AnalysisPhaseSuccessful:
 					metricResult.Successful++
@@ -446,7 +481,14 @@ func (c *Controller) runMeasurements(run *v1alpha1.AnalysisRun, tasks []metricTa
 					metricResult.Error++
 					metricResult.ConsecutiveError++
 					metricResult.ConsecutiveSuccess = 0
-					logger.Warnf("Measurement had error: %s", newMeasurement.Message)
+					if IsRetryableMeasurementError(newMeasurement) {
+						// Timeouts and network errors are transient. They are retried on the
+						// error retry interval and never count as a failed measurement; the run
+						// only aborts once consecutiveErrorLimit is exhausted.
+						logger.Warnf("Retryable measurement error, will retry: %s", newMeasurement.Message)
+					} else {
+						logger.Warnf("Measurement had error: %s", newMeasurement.Message)
+					}
 				}
 			}
 
@@ -526,7 +568,11 @@ func (c *Controller) assessRunStatus(run *v1alpha1.AnalysisRun, metrics []v1alph
 					case v1alpha1.AnalysisPhaseError, v1alpha1.AnalysisPhaseFailed:
 						eventType = corev1.EventTypeWarning
 					}
-					c.recorder.Eventf(run, record.EventOptions{EventType: eventType, EventReason: "Metric" + string(metricStatus)}, "Metric '%s' Completed. Result: %s", metric.Name, metricStatus)
+					if metricStatus == v1alpha1.AnalysisPhaseFailed || metricStatus == v1alpha1.AnalysisPhaseError {
+						c.recordMetricAbortEvent(run, metric, *result, metricStatus, eventType)
+					} else {
+						c.recorder.Eventf(run, record.EventOptions{EventType: eventType, EventReason: "Metric" + string(metricStatus)}, "Metric '%s' Completed. Result: %s", metric.Name, metricStatus)
+					}
 				}
 				if lastMeasurement := analysisutil.LastMeasurement(run, metric.Name); lastMeasurement != nil {
 					result.Message = lastMeasurement.Message

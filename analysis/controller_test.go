@@ -61,6 +61,10 @@ type fixture struct {
 	// fake provider
 	provider *mocks.Provider
 
+	// fakeRecorder captures events emitted during reconciliation; nil until newController is
+	// called.
+	fakeRecorder *record.FakeEventRecorder
+
 	// Reference to frozen now
 	now time.Time
 }
@@ -116,6 +120,7 @@ func (f *fixture) newControllerWithSharedSecret(resync resyncFunc, sharedSecretN
 		K8SRequestProvider: &metrics.K8sRequestsCountProvider{},
 	})
 
+	f.fakeRecorder = record.NewFakeEventRecorder()
 	c := NewController(ControllerConfig{
 		KubeClientSet:                 f.kubeclient,
 		ArgoProjClientset:             f.client,
@@ -125,7 +130,7 @@ func (f *fixture) newControllerWithSharedSecret(resync resyncFunc, sharedSecretN
 		ResyncPeriod:                  resync(),
 		AnalysisRunWorkQueue:          analysisRunWorkqueue,
 		MetricsServer:                 metricsServer,
-		Recorder:                      record.NewFakeEventRecorder(),
+		Recorder:                      f.fakeRecorder,
 		AnalysisSharedSecretNamespace: sharedSecretNamespace,
 		SharedSecretMode:              sharedSecretMode,
 	})
